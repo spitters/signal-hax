@@ -1,0 +1,15 @@
+# Validation manifest: the primitive, the independent reference, its kind, the test files that
+# compare the crate against it, and notes on scope.
+primitive = "Signal Double Ratchet symmetric ratchet (HMAC-SHA-256 KDF chain)"
+
+# tests/reference_crosscheck.rs drives the crate's protocol functions (kdf_ck,
+# kdf_rk, kdf_chain_step, kdf_chain_advance, ratchet_encrypt, ratchet_decrypt)
+# over the reference dependency of tests/common (RustCrypto HMAC-SHA-256 and
+# HKDF-SHA-256) and ties them to an independent recomputation built on the
+# `hmac` crate; the symmetric-ratchet keystream round-trips through
+# ratchet_decrypt.
+reference = "RustCrypto sha2/hmac (RFC 2104, RFC 5869)"
+reference_kind = "independent-crate"
+test_files = ["tests/reference_crosscheck.rs"]
+
+notes = "The crate calls HMAC-SHA-256, HKDF-SHA-256, X25519 and the message encryption through the DoubleRatchetDeps trait and implements no primitive. The reference dependency of the tests uses RustCrypto HMAC and HKDF, a byte-wise XOR in place of X25519 and the XOR keystream as encryption; this file does not claim the DH ratchet is validated against X25519 and does not assert two-party convergence."

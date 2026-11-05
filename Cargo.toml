@@ -1,0 +1,3 @@
+[workspace]
+members = ["x3dh-hax", "pqxdh-hax", "doubleratchet-hax"]
+resolver = "2"

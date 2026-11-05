@@ -1,0 +1,21 @@
+[package]
+name = "pqxdh-hax"
+version = "0.1.0"
+edition = "2021"
+description = "hax-extractable Signal PQXDH key agreement over a primitive trait"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-kem = "0.2"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = { version = "0.8", features = ["std", "std_rng"] }
+hex = "0.4"
+proptest = "1"
+
+[lints.rust]
+# `cfg(kani)` is set by the Kani tool but unknown to rustc.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

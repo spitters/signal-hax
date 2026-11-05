@@ -1,0 +1,16 @@
+[package]
+name = "doubleratchet-hax"
+version = "0.1.0"
+edition = "2021"
+description = "hax-extractable Signal Double Ratchet over a primitive trait"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+sha2 = "0.10"
+hmac = "0.12"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
