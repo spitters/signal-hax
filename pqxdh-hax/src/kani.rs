@@ -108,6 +108,17 @@ mod kani_harnesses {
                 && sig[60] == expected_bytes[4] && sig[61] == expected_bytes[5]
                 && sig[62] == expected_bytes[6] && sig[63] == expected_bytes[7]
         }
+        /// A toy public key is a value in `[2, P)` held in the last eight
+        /// bytes: an element of Z_P^* other than the identity `1`.
+        fn valid_pub(pk: &PqxdhDhKey) -> bool {
+            let mut high_zero = true;
+            let mut i = 0usize;
+            while i < 24 { if pk[i] != 0 { high_zero = false; } i += 1; }
+            let mut v: u64 = 0;
+            let mut j = 24usize;
+            while j < 32 { v = (v << 8) | pk[j] as u64; j += 1; }
+            high_zero && v > 1 && v < P
+        }
     }
 
     // =========================================================
@@ -198,8 +209,10 @@ mod kani_harnesses {
 
         let (bundle, pqsk) = create_bundle::<KaniPqxdh>(&ik_b, &spk_b, &opk_b, &kem_seed);
         let (sk_a, msg, _, _) =
-            initiate::<KaniPqxdh>(&ik_a, &ek_a, &bundle, &kem_rand, true);
-        let sk_b = respond::<KaniPqxdh>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, true);
+            initiate::<KaniPqxdh>(&ik_a, &ek_a, &bundle, &kem_rand, true)
+                .expect("the bundle of toy public keys passes the input check");
+        let sk_b = respond::<KaniPqxdh>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, true)
+            .expect("the message of toy public keys passes the input check");
 
         assert_eq!(sk_a, sk_b, "Alice and Bob MUST agree for ALL key combinations");
     }

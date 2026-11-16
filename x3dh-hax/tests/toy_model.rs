@@ -5,8 +5,10 @@
 //! signature and the KDF; it is not a cryptographic implementation, and the
 //! expected values are not published known answers. The tests run
 //! `create_bundle`, `initiate` and `respond` over this model and check bundle
-//! creation, 3DH/4DH key agreement, that different ephemeral keys give
-//! different session keys, and signature verification.
+//! creation, 3DH/4DH key agreement, that the session key is the KDF of the
+//! DH values alone, that different ephemeral keys give different session
+//! keys, signature verification, and the input check of peer public keys
+//! (including the rejection of the identity `1` of the toy group).
 
 use x3dh_hax::types::*;
 use x3dh_hax::protocol::*;
@@ -69,6 +71,17 @@ impl X3dhCrypto for KaniSimplifiedX3dh {
         sk[24..32].copy_from_slice(&b);
         sk
     }
+    fn kdf3(dh1: &X3dhKey, dh2: &X3dhKey, dh3: &X3dhKey) -> X3dhSessionKey {
+        let v1 = key_to_val(dh1);
+        let v2 = key_to_val(dh2);
+        let v3 = key_to_val(dh3);
+        let result = v1.wrapping_mul(v2.wrapping_add(1))
+            .wrapping_add(v3) % P;
+        let mut sk = ZERO_SESSION_KEY;
+        let b = result.to_be_bytes();
+        sk[24..32].copy_from_slice(&b);
+        sk
+    }
     fn sign(ik_secret: &X3dhKey, msg: &X3dhKey) -> X3dhSignature {
         // Kani-simplified signature: hash(ik_secret || msg) placed in first 32 bytes
         let sv = key_to_val(ik_secret);
@@ -94,6 +107,13 @@ impl X3dhCrypto for KaniSimplifiedX3dh {
             if sig[56 + i] != expected_bytes[i] { ok = false; }
         }
         ok
+    }
+    /// A toy public key is a value in `[2, P)` held in the last eight bytes:
+    /// an element of Z_P^* other than the identity `1`.
+    fn valid_pub(pk: &X3dhKey) -> bool {
+        let mut v: u64 = 0;
+        for i in 24..32 { v = (v << 8) | pk[i] as u64; }
+        pk[..24].iter().all(|&b| b == 0) && v > 1 && v < P
     }
 }
 
@@ -143,10 +163,10 @@ fn kat_x3dh_with_opk() {
     let opk_b = val_to_key(50);
 
     let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
-    let (sk_a, msg, sig_valid) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true);
+    let (sk_a, msg, sig_valid) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).unwrap();
     assert!(sig_valid, "SPK signature valid");
 
-    let sk_b = respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &msg, true);
+    let sk_b = respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &msg, true).unwrap();
     assert_eq!(sk_a, sk_b, "4DH: both sides derive same session key");
 }
 
@@ -163,9 +183,9 @@ fn kat_x3dh_without_opk() {
     let opk_b = val_to_key(50); // present but not used
 
     let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
-    let (sk_a, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false);
+    let (sk_a, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false).unwrap();
 
-    let sk_b = respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &msg, false);
+    let sk_b = respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &msg, false).unwrap();
     assert_eq!(sk_a, sk_b, "3DH: both sides derive same session key");
 }
 
@@ -182,8 +202,8 @@ fn kat_3dh_vs_4dh() {
     let opk_b = val_to_key(50);
 
     let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
-    let (sk_3dh, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false);
-    let (sk_4dh, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true);
+    let (sk_3dh, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false).unwrap();
+    let (sk_4dh, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).unwrap();
 
     assert_ne!(sk_3dh, sk_4dh, "3DH and 4DH produce different keys");
 }
@@ -204,7 +224,7 @@ fn kat_wrong_spk_signature() {
 
     let ik_a = val_to_key(10);
     let ek_a = val_to_key(20);
-    let (_, _, sig_valid) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true);
+    let (_, _, sig_valid) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).unwrap();
     assert!(!sig_valid, "tampered SPK signature should fail");
 }
 
@@ -222,10 +242,39 @@ fn kat_different_ephemeral_keys() {
     let opk_b = val_to_key(50);
 
     let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
-    let (sk1, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a1, &bundle, true);
-    let (sk2, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a2, &bundle, true);
+    let (sk1, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a1, &bundle, true).unwrap();
+    let (sk2, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a2, &bundle, true).unwrap();
 
     assert_ne!(sk1, sk2, "different ephemeral keys => different session keys (forward secrecy)");
+}
+
+// ============================================================
+// 7b. The session key is the KDF of the DH values alone
+// ============================================================
+
+#[test]
+fn kat_key_from_dh_values_alone() {
+    let ik_a = val_to_key(10);
+    let ek_a = val_to_key(20);
+    let ik_b = val_to_key(30);
+    let spk_b = val_to_key(40);
+    let opk_b = val_to_key(50);
+
+    let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
+    let (sk4, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).unwrap();
+    let (sk3, _, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false).unwrap();
+
+    let dh1 = KaniSimplifiedX3dh::dh(&ik_a, &bundle.spk);
+    let dh2 = KaniSimplifiedX3dh::dh(&ek_a, &bundle.ik);
+    let dh3 = KaniSimplifiedX3dh::dh(&ek_a, &bundle.spk);
+    let dh4 = KaniSimplifiedX3dh::dh(&ek_a, &bundle.opk);
+    assert_eq!(sk4, KaniSimplifiedX3dh::kdf(&dh1, &dh2, &dh3, &dh4), "SK = KDF(DH1..DH4)");
+    assert_eq!(sk3, KaniSimplifiedX3dh::kdf3(&dh1, &dh2, &dh3), "SK = KDF(DH1..DH3)");
+
+    // The initiator's identity enters through DH1.
+    let (sk_other, _, _) =
+        initiate::<KaniSimplifiedX3dh>(&val_to_key(11), &ek_a, &bundle, true).unwrap();
+    assert_ne!(sk4, sk_other, "a different initiator identity key gives a different session key");
 }
 
 // ============================================================
@@ -241,7 +290,7 @@ fn kat_init_message_content() {
     let opk_b = val_to_key(50);
 
     let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
-    let (_, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true);
+    let (_, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).unwrap();
 
     assert_eq!(msg.ik_a, KaniSimplifiedX3dh::dh_pub(&ik_a), "msg contains Alice's IK");
     assert_eq!(msg.ek_a, KaniSimplifiedX3dh::dh_pub(&ek_a), "msg contains Alice's EK");
@@ -261,7 +310,7 @@ fn kat_no_opk_id() {
     let opk_b = val_to_key(50);
 
     let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
-    let (_, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false);
+    let (_, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, false).unwrap();
 
     assert_eq!(msg.opk_id, [0, 0, 0, 0], "opk_id is zero when OPK not used");
 }
@@ -392,4 +441,65 @@ fn test_cross_x3dh_keygen() {
     let s3 = StaticSecret::from([17u8; 32]);
     let p3 = PublicKey::from(&s3);
     assert_ne!(p1.as_bytes(), p3.as_bytes(), "different secrets => different keys");
+}
+
+// ============================================================
+// Input check of peer public keys
+// ============================================================
+
+/// A key outside the toy group: the value `P`, which is not reduced.
+fn invalid_key() -> X3dhKey {
+    let mut k = ZERO_KEY;
+    k[24..32].copy_from_slice(&P.to_be_bytes());
+    k
+}
+
+#[test]
+fn initiate_rejects_invalid_bundle_keys() {
+    let ik_a = val_to_key(1234);
+    let ek_a = val_to_key(5678);
+    let bundle = create_bundle::<KaniSimplifiedX3dh>(&val_to_key(11), &val_to_key(22), &val_to_key(33));
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).is_some());
+    let bad_ik = X3dhPreKeyBundle { ik: invalid_key(), ..bundle };
+    let bad_spk = X3dhPreKeyBundle { spk: invalid_key(), ..bundle };
+    let bad_opk = X3dhPreKeyBundle { opk: invalid_key(), ..bundle };
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bad_ik, true).is_none());
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bad_spk, false).is_none());
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bad_opk, true).is_none());
+    // Without the one-time prekey, its key is not used and not checked.
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bad_opk, false).is_some());
+}
+
+#[test]
+fn respond_rejects_invalid_message_keys() {
+    let (ik_b, spk_b, opk_b) = (val_to_key(11), val_to_key(22), val_to_key(33));
+    let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
+    let (_, msg, _) =
+        initiate::<KaniSimplifiedX3dh>(&val_to_key(1234), &val_to_key(5678), &bundle, true)
+            .unwrap();
+    assert!(respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &msg, true).is_some());
+    let bad_ik = X3dhInitMessage { ik_a: invalid_key(), ..msg };
+    let bad_ek = X3dhInitMessage { ek_a: ZERO_KEY, ..msg };
+    assert!(respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &bad_ik, true).is_none());
+    assert!(respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &bad_ek, false).is_none());
+}
+
+/// The identity `1` of the toy group is rejected in every checked position:
+/// on it every DH value would be the identity, independent of the secret.
+#[test]
+fn identity_key_rejected() {
+    let one = val_to_key(1);
+    assert!(!KaniSimplifiedX3dh::valid_pub(&one));
+    let (ik_b, spk_b, opk_b) = (val_to_key(11), val_to_key(22), val_to_key(33));
+    let bundle = create_bundle::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b);
+    let (ik_a, ek_a) = (val_to_key(1234), val_to_key(5678));
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &X3dhPreKeyBundle { ik: one, ..bundle }, false).is_none());
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &X3dhPreKeyBundle { spk: one, ..bundle }, false).is_none());
+    assert!(initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &X3dhPreKeyBundle { opk: one, ..bundle }, true).is_none());
+    let (_, msg, _) = initiate::<KaniSimplifiedX3dh>(&ik_a, &ek_a, &bundle, true).unwrap();
+    let id_ik = X3dhInitMessage { ik_a: one, ..msg };
+    let id_ek = X3dhInitMessage { ek_a: one, ..msg };
+    assert!(respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &id_ik, true).is_none());
+    assert!(respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &id_ek, true).is_none());
+    assert!(respond::<KaniSimplifiedX3dh>(&ik_b, &spk_b, &opk_b, &id_ek, false).is_none());
 }

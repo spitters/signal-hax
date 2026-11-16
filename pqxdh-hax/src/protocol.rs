@@ -17,6 +17,14 @@
 //!   DH4 = DH(EK_A, OPK_B)        (if OPK available)
 //!   (ct, pq_ss) = Encaps(PQPK_B)
 //!   SK  = KDF(F || DH1 || DH2 || DH3 [|| DH4] || pq_ss)
+//!
+//! Every Diffie-Hellman public key received from the peer (the identity key,
+//! the signed prekey and, when it is used, the one-time prekey of a bundle;
+//! the identity key and the ephemeral key of an initial message) passes the
+//! input check `PqxdhCrypto::valid_pub` before any Diffie-Hellman value is
+//! computed on it; `initiate` and `respond` return `None` when one fails. For
+//! X25519 the check is membership in the prime-order subgroup with the
+//! identity excluded (`crate::subgroup::valid_pub`).
 
 use crate::types::*;
 
@@ -64,6 +72,14 @@ pub trait PqxdhCrypto<const KEM_PK: usize, const KEM_SK: usize, const KEM_CT: us
 
     fn sign(ik_secret: &PqxdhDhKey, msg: &[u8; 32]) -> PqxdhSignature;
     fn verify(ik_pub: &PqxdhDhKey, msg: &[u8; 32], sig: &PqxdhSignature) -> bool;
+
+    // ── Input check of peer public keys ──────────────────────────
+
+    /// Input check of a Diffie-Hellman public key received from the peer:
+    /// `true` when `pk` encodes an element other than the identity of the
+    /// prime-order group on which `dh` is the group exponentiation. For
+    /// X25519 this is `crate::subgroup::valid_pub`.
+    fn valid_pub(pk: &PqxdhDhKey) -> bool;
 }
 
 /// Create a PQXDH pre-key bundle for publishing (Bob).
@@ -90,7 +106,38 @@ pub fn create_bundle<
 }
 
 /// Initiator (Alice) performs PQXDH.
+///
+/// Returns `None` when a Diffie-Hellman public key of the bundle that the
+/// computation uses (`ik`, `spk`, and `opk` when `use_opk`) fails the input
+/// check `valid_pub`; otherwise `Some((session_key, init_message,
+/// spk_sig_valid, pqpk_sig_valid))` of `initiate_checked`.
 pub fn initiate<
+    C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
+    const KEM_PK: usize, const KEM_SK: usize, const KEM_CT: usize,
+>(
+    ik_a_secret:    &PqxdhDhKey,
+    ek_a_secret:    &PqxdhDhKey,
+    bundle:         &PqxdhPreKeyBundle<KEM_PK>,
+    kem_randomness: &PqxdhKemSs,
+    use_opk:        bool,
+) -> Option<(PqxdhSessionKey, PqxdhInitMessage<KEM_CT>, bool, bool)> {
+    // Input check of the peer public keys
+    let keys_valid = C::valid_pub(&bundle.ik)
+        && C::valid_pub(&bundle.spk)
+        && (!use_opk || C::valid_pub(&bundle.opk));
+    if keys_valid {
+        Some(initiate_checked::<C, KEM_PK, KEM_SK, KEM_CT>(
+            ik_a_secret, ek_a_secret, bundle, kem_randomness, use_opk,
+        ))
+    } else {
+        None
+    }
+}
+
+/// `initiate` on a bundle whose public keys passed the input check.
+///
+/// Without a one-time prekey, DH4 is the zero block `ZERO_DH_KEY`.
+fn initiate_checked<
     C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
     const KEM_PK: usize, const KEM_SK: usize, const KEM_CT: usize,
 >(
@@ -124,7 +171,35 @@ pub fn initiate<
 }
 
 /// Responder (Bob) processes Alice's PQXDH message.
+///
+/// Returns `None` when a Diffie-Hellman public key of the message (`ik_a`,
+/// `ek_a`) fails the input check `valid_pub`; otherwise `Some(session_key)`
+/// of `respond_checked`.
 pub fn respond<
+    C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
+    const KEM_PK: usize, const KEM_SK: usize, const KEM_CT: usize,
+>(
+    ik_b_secret:  &PqxdhDhKey,
+    spk_b_secret: &PqxdhDhKey,
+    opk_b_secret: &PqxdhDhKey,
+    pqsk_b:       &[u8; KEM_SK],
+    msg:          &PqxdhInitMessage<KEM_CT>,
+    use_opk:      bool,
+) -> Option<PqxdhSessionKey> {
+    // Input check of the peer public keys
+    if C::valid_pub(&msg.ik_a) && C::valid_pub(&msg.ek_a) {
+        Some(respond_checked::<C, KEM_PK, KEM_SK, KEM_CT>(
+            ik_b_secret, spk_b_secret, opk_b_secret, pqsk_b, msg, use_opk,
+        ))
+    } else {
+        None
+    }
+}
+
+/// `respond` on a message whose public keys passed the input check.
+///
+/// Without a one-time prekey, DH4 is the zero block `ZERO_DH_KEY`.
+fn respond_checked<
     C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
     const KEM_PK: usize, const KEM_SK: usize, const KEM_CT: usize,
 >(

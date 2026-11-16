@@ -1,15 +1,37 @@
 # Validation manifest: the primitive, the independent reference, its kind, the test files that
 # compare the crate against it, and notes on scope.
-primitive = "Signal Double Ratchet symmetric ratchet (HMAC-SHA-256 KDF chain)"
+primitive = "Signal Double Ratchet protocol logic (Revision 4, sections 3.1-3.5 and 7.2, libsignal constants)"
 
-# tests/reference_crosscheck.rs drives the crate's protocol functions (kdf_ck,
-# kdf_rk, kdf_chain_step, kdf_chain_advance, ratchet_encrypt, ratchet_decrypt)
-# over the reference dependency of tests/common (RustCrypto HMAC-SHA-256 and
-# HKDF-SHA-256) and ties them to an independent recomputation built on the
-# `hmac` crate; the symmetric-ratchet keystream round-trips through
-# ratchet_decrypt.
-reference = "RustCrypto sha2/hmac (RFC 2104, RFC 5869)"
+# tests/reference_crosscheck.rs and tests/proptest_equiv.rs tie kdf_ck, kdf_rk, encode_header,
+# concat_ad, ct_len and the ciphertexts of ratchet_encrypt to independent recomputations on
+# RustCrypto hmac, hkdf, aes and cbc.
+#
+# tests/session_setup.rs, tests/out_of_order.rs and tests/authentication.rs check the session
+# setup, the DH ratchet step on receipt, the skipped-message-key store with MAX_SKIP and
+# MAX_STORED, replay rejection and the authentication of CONCAT(AD, header) and of the
+# ciphertext, with transactional decryption, against sections 3.3-3.5 of the specification.
+reference = "RustCrypto hmac/hkdf/sha2 (RFC 2104, RFC 5869), aes/cbc (FIPS 197, SP 800-38A), x25519-dalek (RFC 7748)"
 reference_kind = "independent-crate"
-test_files = ["tests/reference_crosscheck.rs"]
+test_files = [
+    "tests/reference_crosscheck.rs",
+    "tests/proptest_equiv.rs",
+    "tests/protocol_logic.rs",
+    "tests/session_setup.rs",
+    "tests/out_of_order.rs",
+    "tests/authentication.rs",
+]
 
-notes = "The crate calls HMAC-SHA-256, HKDF-SHA-256, X25519 and the message encryption through the DoubleRatchetDeps trait and implements no primitive. The reference dependency of the tests uses RustCrypto HMAC and HKDF, a byte-wise XOR in place of X25519 and the XOR keystream as encryption; this file does not claim the DH ratchet is validated against X25519 and does not assert two-party convergence."
+notes = """
+The crate calls HMAC-SHA-256, HKDF-SHA-256, X25519 and the message encryption through the
+DoubleRatchetDeps trait and implements no primitive.
+
+The reference dependency of the tests (tests/common) implements the trait with RustCrypto
+HMAC-SHA-256 and HKDF-SHA-256, X25519 of x25519-dalek, and the message encryption of section
+7.2 with the libsignal constants: HKDF of the message key under "WhisperMessageKeys" into an
+AES-256 key, an HMAC key and an IV; AES-256-CBC with PKCS#7 padding; HMAC-SHA-256 over the
+associated data and the ciphertext, truncated to 8 bytes.
+
+The Signal specification has no published test vectors; the tests compare against
+recomputations from the independent crates and against the behaviour that sections 3.3-3.5
+prescribe.
+"""

@@ -66,6 +66,18 @@ mod kani_harnesses {
             sk[28] = b[4]; sk[29] = b[5]; sk[30] = b[6]; sk[31] = b[7];
             sk
         }
+        fn kdf3(dh1: &X3dhKey, dh2: &X3dhKey, dh3: &X3dhKey) -> X3dhSessionKey {
+            let v1 = key_to_val(dh1);
+            let v2 = key_to_val(dh2);
+            let v3 = key_to_val(dh3);
+            let result = v1.wrapping_mul(v2.wrapping_add(1))
+                .wrapping_add(v3) % P;
+            let mut sk = ZERO_SESSION_KEY;
+            let b = result.to_be_bytes();
+            sk[24] = b[0]; sk[25] = b[1]; sk[26] = b[2]; sk[27] = b[3];
+            sk[28] = b[4]; sk[29] = b[5]; sk[30] = b[6]; sk[31] = b[7];
+            sk
+        }
         fn sign(ik_secret: &X3dhKey, msg: &X3dhKey) -> X3dhSignature {
             let sv = key_to_val(ik_secret);
             let mv = key_to_val(msg);
@@ -89,6 +101,17 @@ mod kani_harnesses {
                 && sig[58] == expected_bytes[2] && sig[59] == expected_bytes[3]
                 && sig[60] == expected_bytes[4] && sig[61] == expected_bytes[5]
                 && sig[62] == expected_bytes[6] && sig[63] == expected_bytes[7]
+        }
+        /// A toy public key is a value in `[2, P)` held in the last eight
+        /// bytes: an element of Z_P^* other than the identity `1`.
+        fn valid_pub(pk: &X3dhKey) -> bool {
+            let mut high_zero = true;
+            let mut i = 0usize;
+            while i < 24 { if pk[i] != 0 { high_zero = false; } i += 1; }
+            let mut v: u64 = 0;
+            let mut j = 24usize;
+            while j < 32 { v = (v << 8) | pk[j] as u64; j += 1; }
+            high_zero && v > 1 && v < P
         }
     }
 
@@ -144,8 +167,10 @@ mod kani_harnesses {
         let opk_b = val_to_key(opk_b_v as u64);
 
         let bundle = create_bundle::<KaniX3dh>(&ik_b, &spk_b, &opk_b);
-        let (sk_a, msg, _) = initiate::<KaniX3dh>(&ik_a, &ek_a, &bundle, true);
-        let sk_b = respond::<KaniX3dh>(&ik_b, &spk_b, &opk_b, &msg, true);
+        let (sk_a, msg, _) = initiate::<KaniX3dh>(&ik_a, &ek_a, &bundle, true)
+            .expect("the bundle of toy public keys passes the input check");
+        let sk_b = respond::<KaniX3dh>(&ik_b, &spk_b, &opk_b, &msg, true)
+            .expect("the message of toy public keys passes the input check");
 
         assert_eq!(sk_a, sk_b, "X3DH 4DH: Alice and Bob MUST agree");
     }
@@ -169,8 +194,10 @@ mod kani_harnesses {
         let opk_b = val_to_key(opk_b_v as u64);
 
         let bundle = create_bundle::<KaniX3dh>(&ik_b, &spk_b, &opk_b);
-        let (sk_a, msg, _) = initiate::<KaniX3dh>(&ik_a, &ek_a, &bundle, false);
-        let sk_b = respond::<KaniX3dh>(&ik_b, &spk_b, &opk_b, &msg, false);
+        let (sk_a, msg, _) = initiate::<KaniX3dh>(&ik_a, &ek_a, &bundle, false)
+            .expect("the bundle of toy public keys passes the input check");
+        let sk_b = respond::<KaniX3dh>(&ik_b, &spk_b, &opk_b, &msg, false)
+            .expect("the message of toy public keys passes the input check");
 
         assert_eq!(sk_a, sk_b, "X3DH 3DH: Alice and Bob MUST agree");
     }

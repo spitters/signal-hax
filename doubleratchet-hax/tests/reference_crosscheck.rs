@@ -1,232 +1,160 @@
-//! Reference cross-checks for doubleratchet-hax against an independent
-//! implementation of the primitives (RustCrypto `sha2` / `hmac`).
-//!
-//! ## What is tied to what
+//! Reference cross-checks of doubleratchet-hax against independent implementations of the
+//! primitives (RustCrypto `hmac`, `hkdf`, `aes`, `cbc`).
 //!
 //! The crate implements the protocol logic of the Signal Double Ratchet over the
-//! `DoubleRatchetDeps` trait; the tests run it over the reference dependency
-//! `RefDeps` of `tests/common` (RustCrypto HMAC-SHA-256 and HKDF-SHA-256). The
-//! chain is
+//! `DoubleRatchetDeps` trait; the tests run it over the reference dependency `RefDeps` of
+//! `tests/common`. They check, byte for byte:
 //!
-//!   kdf_ck(ck, c)      = HMAC-SHA-256(ck, [c; 32])
-//!   kdf_chain_step(ck) = (kdf_ck(ck, 0x01), kdf_ck(ck, 0x02))
-//!   kdf_rk(rk, dh)     = (HKDF-SHA-256(rk, dh, [0x01; 32]),
-//!                         HKDF-SHA-256(rk, dh, [0x02; 32]))
+//! - `kdf_ck(ck) = (HMAC-SHA-256(ck, 0x02), HMAC-SHA-256(ck, 0x01))` (7.2, libsignal seeds);
+//! - `kdf_rk(rk, dh)` is the 64-byte output of HKDF-SHA-256 with salt `rk`, input `dh` and
+//!   info `"WhisperRatchet"`, split into root key and chain key (libsignal `create_chain`);
+//! - the header encoding `dh || pn || n` (big-endian) and `CONCAT(AD, header)`;
+//! - `ct_len(pt_len)` is the length of the deployed ciphertext;
+//! - each ciphertext of `ratchet_encrypt` equals the 7.2 encryption, recomputed from the
+//!   independent chain, of the plaintext under `CONCAT(AD, header)`.
 //!
-//! and the tests check, byte for byte, that the crate's kdf_ck / kdf_rk /
-//! kdf_chain_step / kdf_chain_advance / ratchet_encrypt / ratchet_decrypt agree
-//! with an independent recomputation built on the RustCrypto `hmac` crate, and
-//! that the symmetric-ratchet keystream round-trips.
-//!
-//! ## Scope
-//!
-//! The reference dependency's X25519 is a byte-wise XOR stub and its encryption
-//! is the XOR keystream under the message key. This file does not claim the DH
-//! ratchet is validated against X25519 and does not assert two-party
-//! convergence (the XOR stub lacks the symmetry DH(a,B) = DH(b,A)).
-//!
-//! ## References
-//! - RFC 5869: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
-//! - RFC 2104: HMAC: Keyed-Hashing for Message Authentication
-//! - FIPS 180-4 / RFC 6234: SHA-256
-//! - RustCrypto `sha2` / `hmac`
+//! References: RFC 2104 (HMAC), RFC 5869 (HKDF), FIPS 197 (AES), NIST SP 800-38A (CBC),
+//! Signal, The Double Ratchet Algorithm, Revision 4, sections 3.4 and 7.2.
 
 mod common;
-use common::RefDeps;
+use common::{buf, hmac, keypair_of, signal_decrypt, signal_encrypt, test_ad, RefDeps};
 use doubleratchet_hax::{
-    dh, kdf_chain_advance, kdf_chain_step, kdf_ck, kdf_rk, ratchet_decrypt, ratchet_encrypt,
-    ratchet_init_initiator, MAX_PLAINTEXT_LEN,
+    concat_ad, ct_len, dh, encode_header, kdf_ck, kdf_rk, ratchet_encrypt, ratchet_init_alice,
+    split64, MessageHeader, AD_LEN, CHAIN_KEY_SEED, FULL_AD_LEN, HEADER_LEN, KDF_RK_INFO,
+    MAX_CT_LEN, MAX_PLAINTEXT_LEN, MESSAGE_KEY_SEED, TAG_LEN,
 };
-
-use hmac::{Hmac, Mac};
+use hkdf::Hkdf;
 use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
-
-// Independent HMAC-SHA-256 via the RustCrypto `hmac` crate.
-fn ref_hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(msg);
-    let out = mac.finalize().into_bytes();
-    let mut a = [0u8; 32];
-    a.copy_from_slice(&out);
-    a
-}
-
-// A cheap deterministic byte generator so the tests sweep many inputs
-// without an rng dependency.
-fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+// A deterministic byte generator, so the tests sweep many inputs without an rng dependency.
+fn lcg32(seed: u64) -> [u8; 32] {
     let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+    let mut out = [0u8; 32];
+    for b in out.iter_mut() {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        out.push((x >> 33) as u8);
+        *b = (x >> 33) as u8;
     }
     out
 }
 
-// ===========================================================================
-// 1. crate kdf_ck / kdf_chain_step == independent HMAC of the crate's
-//    chain-step constants.
-// ===========================================================================
+#[test]
+fn constants_are_the_libsignal_values() {
+    assert_eq!(KDF_RK_INFO, *b"WhisperRatchet");
+    assert_eq!(MESSAGE_KEY_SEED, [0x01]);
+    assert_eq!(CHAIN_KEY_SEED, [0x02]);
+    assert_eq!(TAG_LEN, 8);
+    assert_eq!(FULL_AD_LEN, AD_LEN + HEADER_LEN);
+}
 
 #[test]
-fn kdf_chain_step_matches_independent_hmac() {
+fn kdf_ck_matches_independent_hmac() {
     for seed in 0..16u64 {
-        let ck0: [u8; 32] = {
-            let v = lcg_bytes(0xC0FFEE ^ seed, 32);
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&v);
-            a
-        };
-
-        // Independent chain step: new_ck = HMAC(ck, [0x01; 32]), mk = HMAC(ck, [0x02; 32]).
-        let ref_ck = ref_hmac_sha256(&ck0, &[0x01; 32]);
-        let ref_mk = ref_hmac_sha256(&ck0, &[0x02; 32]);
-
-        assert_eq!(kdf_ck::<RefDeps>(&ck0, 0x01), ref_ck, "kdf_ck::<RefDeps>(_,0x01) == HMAC(ck,0x01)");
-        assert_eq!(kdf_ck::<RefDeps>(&ck0, 0x02), ref_mk, "kdf_ck::<RefDeps>(_,0x02) == HMAC(ck,0x02)");
-
-        let (crate_ck, crate_mk) = kdf_chain_step::<RefDeps>(&ck0);
-        assert_eq!(crate_ck, ref_ck, "kdf_chain_step CK == independent HMAC");
-        assert_eq!(crate_mk, ref_mk, "kdf_chain_step MK == independent HMAC");
+        let ck = lcg32(0xC0FFEE ^ seed);
+        let (next_ck, mk) = kdf_ck::<RefDeps>(&ck);
+        assert_eq!(next_ck, hmac(&ck, &[0x02]), "next chain key = HMAC(ck, 0x02)");
+        assert_eq!(mk, hmac(&ck, &[0x01]), "message key = HMAC(ck, 0x01)");
     }
 }
 
-// ===========================================================================
-// 2. crate kdf_chain_advance == N independent HMAC chain steps.
-// ===========================================================================
-
 #[test]
-fn kdf_chain_advance_matches_independent_hmac() {
-    let ck0: [u8; 32] = [0x42u8; 32];
-    for steps in 0..12usize {
-        // Independent advance: repeatedly ck <- HMAC(ck, 0x01).
-        let mut cur = ck0;
-        for _ in 0..steps {
-            cur = ref_hmac_sha256(&cur, &[0x01; 32]);
-        }
-        assert_eq!(
-            kdf_chain_advance::<RefDeps>(&ck0, steps),
-            cur,
-            "kdf_chain_advance::<RefDeps>({steps}) == {steps} independent HMAC steps"
-        );
-    }
-}
-
-// ===========================================================================
-// 3. crate kdf_rk == independent HKDF of (rk, dh_out).
-//    The DH input is the crate's OWN (XOR-stub) dh::<RefDeps>(); the KDF is the
-//    independent HMAC. This ties the root-key KDF to an independent reference.
-// ===========================================================================
-
-#[test]
-fn kdf_rk_matches_independent_hmac() {
-    for seed in 0..12u64 {
-        let rk: [u8; 32] = {
-            let v = lcg_bytes(0xD00D ^ seed, 32);
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&v);
-            a
-        };
-        let sk: [u8; 32] = {
-            let v = lcg_bytes(0xBEEF ^ seed, 32);
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&v);
-            a
-        };
-        let pk: [u8; 32] = {
-            let v = lcg_bytes(0xF00D ^ seed, 32);
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&v);
-            a
-        };
-
-        let dh_out = dh::<RefDeps>(&sk, &pk); // crate's own (XOR-stub) DH output
-        // Independent HKDF-SHA-256 (RFC 5869): PRK = HMAC(rk, dh), one Expand
-        // block T(1) = HMAC(PRK, info || 0x01) under the info blocks [c; 32].
-        let prk = ref_hmac_sha256(&rk, &dh_out);
-        let mut in1 = [0x01u8; 33];
-        in1[32] = 0x01;
-        let mut in2 = [0x02u8; 33];
-        in2[32] = 0x01;
-
-        let ref_rk = ref_hmac_sha256(&prk, &in1);
-        let ref_ck = ref_hmac_sha256(&prk, &in2);
-
+fn kdf_rk_matches_independent_hkdf() {
+    for seed in 0..16u64 {
+        let rk = lcg32(0xD00D ^ seed);
+        let sk = lcg32(0xBEEF ^ seed);
+        let pk = keypair_of(0x77, seed as u32).1;
+        let dh_out = dh::<RefDeps>(&sk, &pk);
+        let mut okm = [0u8; 64];
+        Hkdf::<Sha256>::new(Some(&rk[..]), &dh_out)
+            .expand(b"WhisperRatchet", &mut okm)
+            .expect("64 bytes");
         let (new_rk, new_ck) = kdf_rk::<RefDeps>(&rk, &dh_out);
-        assert_eq!(new_rk, ref_rk, "kdf_rk new_rk == HKDF(rk, dh, [0x01; 32])");
-        assert_eq!(new_ck, ref_ck, "kdf_rk new_ck == HKDF(rk, dh, [0x02; 32])");
+        assert_eq!(new_rk[..], okm[..32], "root key = HKDF output bytes 0..32");
+        assert_eq!(new_ck[..], okm[32..], "chain key = HKDF output bytes 32..64");
+        assert_eq!(split64(&okm), (new_rk, new_ck));
     }
 }
 
-// ===========================================================================
-// 4. the symmetric ratchet keystream round-trips and matches an
-//    independent HMAC keystream recomputation.
-//
-//    We drive the crate's OWN ratchet_encrypt / ratchet_decrypt. Encryption
-//    steps the sending chain; decryption steps a receiving chain initialised to
-//    the same chain key, so it recovers the plaintext (round-trip). We also
-//    recompute the message-key stream independently via the `hmac` crate and
-//    confirm each ciphertext equals plaintext XOR that independent keystream.
-// ===========================================================================
+#[test]
+fn x25519_agreement_of_the_reference() {
+    let (a_sk, a_pk) = keypair_of(0xa0, 0);
+    let (b_sk, b_pk) = keypair_of(0xb0, 0);
+    assert_eq!(dh::<RefDeps>(&a_sk, &b_pk), dh::<RefDeps>(&b_sk, &a_pk));
+}
 
 #[test]
-fn symmetric_ratchet_keystream_matches_independent_hmac() {
-    let root_key = [0x11u8; 32];
-    let my_sk = [0x22u8; 32];
-    let my_pk = [0x33u8; 32];
-    let remote_pk = [0x44u8; 32];
+fn encode_header_byte_layout() {
+    let h = MessageHeader { dh: lcg32(5), pn: 0x0102_0304, n: 0xa0b0_c0d0 };
+    let e = encode_header(&h);
+    assert_eq!(e[..32], h.dh[..]);
+    assert_eq!(e[32..36], [0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(e[36..40], [0xa0, 0xb0, 0xc0, 0xd0]);
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&h.dh);
+    expected.extend_from_slice(&h.pn.to_be_bytes());
+    expected.extend_from_slice(&h.n.to_be_bytes());
+    assert_eq!(e[..], expected[..]);
 
-    // Sender state (initiator derives a real send chain key via kdf_rk).
-    let mut send_state = ratchet_init_initiator::<RefDeps>(&root_key, &my_sk, &my_pk, &remote_pk);
+    let ad = test_ad();
+    let full = concat_ad(&ad, &h);
+    assert_eq!(full[..AD_LEN], ad[..]);
+    assert_eq!(full[AD_LEN..], e[..]);
+}
 
-    // Receiver whose receiving chain starts at the SAME chain key as the
-    // sender's send chain, so decryption tracks encryption.
-    let mut recv_state = send_state; // Copy; recv_ck is set below.
-    recv_state.recv_ck = send_state.send_ck;
+#[test]
+fn ct_len_is_the_deployed_ciphertext_length() {
+    let mk = lcg32(9);
+    let ad = [0x5c; FULL_AD_LEN];
+    for pt_len in 0..=MAX_PLAINTEXT_LEN {
+        let pt = vec![0x3a; pt_len];
+        let ct = signal_encrypt(&mk, &pt, &ad);
+        assert_eq!(ct.len(), ct_len(pt_len), "ct_len({pt_len})");
+        assert!(ct_len(pt_len) <= MAX_CT_LEN);
+        assert_eq!(signal_decrypt(&mk, &ct, &ad), Some(pt));
+    }
+}
 
-    // Independent chain key mirror (RustCrypto hmac).
-    let mut ref_ck = send_state.send_ck;
+/// The ciphertexts of `ratchet_encrypt` equal the 7.2 encryption under the message keys of an
+/// independent recomputation of the sending chain, with the associated data
+/// `AD || dh || pn || n`.
+#[test]
+fn ratchet_encrypt_matches_independent_encryption() {
+    let (a_sk, a_pk) = keypair_of(0xa0, 0);
+    let (_b_sk, b_pk) = keypair_of(0xb0, 0);
+    let sk = [0x11u8; 32];
+    let ad = test_ad();
+    let mut st = ratchet_init_alice::<RefDeps>(&sk, &b_pk, &a_sk, &a_pk);
 
-    let messages: [&[u8]; 4] = [
+    // Independent sending chain: KDF_RK by HKDF, then KDF_CK by HMAC.
+    let mut okm = [0u8; 64];
+    Hkdf::<Sha256>::new(Some(&sk[..]), &x25519_dalek::x25519(a_sk, b_pk))
+        .expand(b"WhisperRatchet", &mut okm)
+        .expect("64 bytes");
+    let mut ck: [u8; 32] = okm[32..].try_into().unwrap();
+    assert_eq!(st.cks, Some(ck));
+
+    let messages: [&[u8]; 5] = [
         b"ratchet message zero",
         b"the second plaintext, a little longer than the first one here",
         b"three",
-        b"", // empty plaintext is valid
+        b"",
+        &[0xee; MAX_PLAINTEXT_LEN],
     ];
-
-    for (i, &pt) in messages.iter().enumerate() {
-        let pt_len = pt.len();
-        let mut pt_buf = [0u8; MAX_PLAINTEXT_LEN];
-        pt_buf[..pt_len].copy_from_slice(pt);
-
-        // Independent message key for THIS step: mk = HMAC(ck, 0x02).
-        let ref_mk = ref_hmac_sha256(&ref_ck, &[0x02; 32]);
-        // Advance the independent chain: ck <- HMAC(ck, 0x01).
-        ref_ck = ref_hmac_sha256(&ref_ck, &[0x01; 32]);
-
-        // Crate encryption.
-        let (next_send, _hdr, ct) = ratchet_encrypt::<RefDeps>(&send_state, &pt_buf, pt_len);
-        send_state = next_send;
-
-        // Ciphertext must equal plaintext XOR the INDEPENDENT keystream.
-        for j in 0..pt_len {
-            assert_eq!(
-                ct[j],
-                pt_buf[j] ^ ref_mk[j % 32],
-                "ct[{j}] == pt ^ independent HMAC keystream (msg {i})"
-            );
-        }
-
-        // Crate decryption round-trips.
-        let header = doubleratchet_hax::MessageHeader {
-            dh_public: my_pk,
-            msg_number: i as u32,
-            prev_chain_len: 0,
-        };
-        let (next_recv, rec) = ratchet_decrypt::<RefDeps>(&recv_state, &header, &ct, pt_len);
-        recv_state = next_recv;
-        assert_eq!(&rec[..pt_len], &pt_buf[..pt_len], "decrypt recovers plaintext (msg {i})");
+    for (i, &msg) in messages.iter().enumerate() {
+        let mk = hmac(&ck, &[0x01]);
+        ck = hmac(&ck, &[0x02]);
+        let (b, n) = buf(msg);
+        let (st1, h, ct, len) = ratchet_encrypt::<RefDeps>(&st, &b, n, &ad).expect("chain");
+        assert_eq!((h.dh, h.pn, h.n), (a_pk, 0, i as u32), "header of message {i}");
+        let mut full_ad = ad.to_vec();
+        full_ad.extend_from_slice(&a_pk);
+        full_ad.extend_from_slice(&0u32.to_be_bytes());
+        full_ad.extend_from_slice(&(i as u32).to_be_bytes());
+        let expected = signal_encrypt(&mk, msg, &full_ad);
+        assert_eq!(len, expected.len());
+        assert_eq!(ct[..len], expected[..], "ciphertext of message {i}");
+        assert!(ct[len..].iter().all(|x| *x == 0), "the buffer is zero after the ciphertext");
+        st = st1;
     }
+    assert_eq!(st.cks, Some(ck));
+    assert_eq!(st.ns, messages.len() as u32);
 }

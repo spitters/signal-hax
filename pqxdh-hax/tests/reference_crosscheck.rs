@@ -25,7 +25,10 @@
 //!   [REAL-STRUCT] FIPS 203 ML-KEM-768 byte sizes (ek 1184, dk 2400, ct 1088).
 //!   [REAL-PROTO]  OUR full pqxdh protocol (`initiate`/`respond`) with real
 //!                 ML-KEM-768 + X25519 + HKDF: Alice and Bob derive the same
-//!                 session key.
+//!                 session key; `initiate` and `respond` reject peer
+//!                 Diffie-Hellman keys that fail the X25519 input check
+//!                 (`subgroup::valid_pub`): the identity, a point of order 4,
+//!                 a twist point and a non-canonical string.
 //!
 //! Signatures in this instance are a key-independent, internally consistent
 //! stand-in (`sign` then `verify` holds): the KEM/DH/KDF are the primitives
@@ -145,6 +148,11 @@ impl PqxdhCrypto<1184, 2400, 1088> for RealMlKem768 {
         let d = h.finalize();
         sig[0..32] == d[..]
     }
+
+    // ── Input check: X25519 subgroup membership, the identity excluded ──
+    fn valid_pub(pk: &PqxdhDhKey) -> bool {
+        pqxdh_hax::subgroup::valid_pub(pk)
+    }
 }
 
 fn seed(n: u8) -> [u8; 32] { [n; 32] }
@@ -251,9 +259,11 @@ fn full_pqxdh_protocol_with_opk_real_mlkem() {
     let kem_rand = seed(0x70);
 
     let (sk_a, msg, spk_valid, pqpk_valid) =
-        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle, &kem_rand, true);
+        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle, &kem_rand, true)
+            .expect("X25519 public keys pass the input check");
     let sk_b =
-        respond::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &pqsk_b, &msg, true);
+        respond::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &pqsk_b, &msg, true)
+            .expect("X25519 public keys pass the input check");
 
     assert!(spk_valid && pqpk_valid, "bundle signatures verify (consistent stand-in)");
     assert_eq!(sk_a, sk_b,
@@ -276,9 +286,11 @@ fn full_pqxdh_protocol_without_opk_real_mlkem() {
     let kem_rand = seed(0x71);
 
     let (sk_a, msg, _, _) =
-        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle, &kem_rand, false);
+        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle, &kem_rand, false)
+            .expect("X25519 public keys pass the input check");
     let sk_b =
-        respond::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &pqsk_b, &msg, false);
+        respond::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &pqsk_b, &msg, false)
+            .expect("X25519 public keys pass the input check");
 
     assert_eq!(sk_a, sk_b, "PQXDH 3DH + real ML-KEM-768: both sides agree");
 }
@@ -301,12 +313,101 @@ fn pq_contribution_changes_session_key_real_mlkem() {
     let (bundle1, _) =
         create_bundle::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &seed(0x63));
     let (sk1, _, _, _) =
-        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle1, &kem_rand, true);
+        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle1, &kem_rand, true)
+            .expect("X25519 public keys pass the input check");
 
     let (bundle2, _) =
         create_bundle::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &seed(0x64));
     let (sk2, _, _, _) =
-        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle2, &kem_rand, true);
+        initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle2, &kem_rand, true)
+            .expect("X25519 public keys pass the input check");
 
     assert_ne!(sk1, sk2, "different ML-KEM keypair => different session key");
+}
+
+// ============================================================
+// 7. [REAL-PROTO] input check of peer public keys (X25519 subgroup check)
+// ============================================================
+
+/// The little-endian encoding of a small number.
+fn num(v: u64) -> PqxdhDhKey {
+    let mut o = [0u8; 32];
+    o[..8].copy_from_slice(&v.to_le_bytes());
+    o
+}
+
+/// Keys that fail the input check: the identity `0`; `1`, the u-coordinate of
+/// the points of order 4; `p - 1`, a point of the quadratic twist; and the
+/// base point with bit 255 set, a non-canonical string.
+fn rejected_keys() -> [PqxdhDhKey; 4] {
+    let mut m1 = [0xffu8; 32];
+    m1[0] = 0xec;
+    m1[31] = 0x7f;
+    let mut nine_high = num(9);
+    nine_high[31] |= 0x80;
+    [[0u8; 32], num(1), m1, nine_high]
+}
+
+#[test]
+fn input_check_x25519() {
+    for k in rejected_keys() {
+        assert!(!RealMlKem768::valid_pub(&k), "rejected key {:?}", k);
+    }
+    // The identity is a point of the subgroup; the input check excludes it.
+    assert!(pqxdh_hax::subgroup::is_subgroup_point(&[0u8; 32]));
+    assert!(RealMlKem768::valid_pub(&num(9)), "base point accepted");
+    for n in 1u8..8 {
+        let pk = RealMlKem768::dh_pub(&seed(n));
+        assert!(RealMlKem768::valid_pub(&pk), "X25519 public key accepted");
+    }
+}
+
+#[test]
+fn initiate_rejects_invalid_bundle_keys_real_mlkem() {
+    let (ik_b, spk_b, opk_b) = (seed(0x34), seed(0x44), seed(0x54));
+    let (bundle, _) =
+        create_bundle::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &seed(0x65));
+    let (ik_a, ek_a, kem_rand) = (seed(0x14), seed(0x24), seed(0x74));
+    assert!(initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &bundle, &kem_rand, true)
+        .is_some());
+    for bad in rejected_keys() {
+        for slot in 0..3 {
+            let mut b = bundle;
+            match slot {
+                0 => b.ik = bad,
+                1 => b.spk = bad,
+                _ => b.opk = bad,
+            }
+            assert!(initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &b, &kem_rand, true)
+                .is_none());
+            // Without the one-time prekey, its key is not used and not checked.
+            assert_eq!(
+                initiate::<RealMlKem768, 1184, 2400, 1088>(&ik_a, &ek_a, &b, &kem_rand, false)
+                    .is_none(),
+                slot != 2
+            );
+        }
+    }
+}
+
+#[test]
+fn respond_rejects_invalid_message_keys_real_mlkem() {
+    let (ik_b, spk_b, opk_b) = (seed(0x35), seed(0x45), seed(0x55));
+    let (bundle, pqsk_b) =
+        create_bundle::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &seed(0x66));
+    let (_, msg, _, _) = initiate::<RealMlKem768, 1184, 2400, 1088>(
+        &seed(0x15), &seed(0x25), &bundle, &seed(0x75), true)
+        .expect("X25519 public keys pass the input check");
+    assert!(respond::<RealMlKem768, 1184, 2400, 1088>(&ik_b, &spk_b, &opk_b, &pqsk_b, &msg, true)
+        .is_some());
+    for bad in rejected_keys() {
+        for use_opk in [true, false] {
+            let bad_ik = PqxdhInitMessage { ik_a: bad, ..msg };
+            let bad_ek = PqxdhInitMessage { ek_a: bad, ..msg };
+            assert!(respond::<RealMlKem768, 1184, 2400, 1088>(
+                &ik_b, &spk_b, &opk_b, &pqsk_b, &bad_ik, use_opk).is_none());
+            assert!(respond::<RealMlKem768, 1184, 2400, 1088>(
+                &ik_b, &spk_b, &opk_b, &pqsk_b, &bad_ek, use_opk).is_none());
+        }
+    }
 }

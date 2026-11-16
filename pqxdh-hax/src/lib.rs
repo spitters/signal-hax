@@ -7,9 +7,11 @@
 //! proofs use ML-KEM-768.
 //!
 //! The modules of `src/` use fixed-size arrays and bounded loops; the
-//! `PqxdhCrypto` trait abstracts DH, KEM, KDF, and signature operations. The
-//! Lean extraction and its correspondence to the model are described in the
-//! README.
+//! `PqxdhCrypto` trait abstracts DH, KEM, KDF, signature operations and the
+//! input check of peer public keys. `subgroup` implements the input check for
+//! X25519 (membership in the prime-order subgroup, the identity excluded).
+//! The Lean extraction and its correspondence to the model are described in
+//! the README.
 //!
 //! ## Protocol (Signal PQXDH Specification, September 2023)
 //!
@@ -36,6 +38,12 @@
 pub mod types;
 pub mod protocol;
 pub mod typestate_fsm;
+
+// The subgroup check is a leaf primitive: the extracted protocol calls it through
+// `PqxdhCrypto::valid_pub`, and the Lean model gives it by its specification
+// (`subgroupCheckU` with the identity excluded), so the module is not extracted.
+#[cfg(not(hax))]
+pub mod subgroup;
 
 pub use types::*;
 pub use protocol::*;

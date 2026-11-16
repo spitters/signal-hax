@@ -83,18 +83,25 @@ impl Start {
 impl BundleReceived {
     /// Transition `BundleReceived -> SessionEstablished`: run X3DH and emit the
     /// initial message. Consumes `self`, so the bundle cannot be reused.
+    /// Returns `None`, and emits nothing, when a public key of the bundle fails
+    /// the input check of `initiate`.
     pub fn send_init<C: X3dhCrypto, G: X3dhGhost>(
         self,
         ghost: &mut G,
         ik_a_secret: &X3dhKey,
         ek_a_secret: &X3dhKey,
         use_opk: bool,
-    ) -> SessionEstablished {
-        let (sk, msg, sig_valid) =
-            initiate::<C>(ik_a_secret, ek_a_secret, &self.bundle, use_opk);
-        ghost.send_init(&msg);
-        ghost.event(1, &msg.ek_a);
-        SessionEstablished { session_key: sk, sig_valid }
+    ) -> Option<SessionEstablished> {
+        let initiated = initiate::<C>(ik_a_secret, ek_a_secret, &self.bundle, use_opk);
+        match initiated {
+            Some(result) => {
+                let (sk, msg, sig_valid) = result;
+                ghost.send_init(&msg);
+                ghost.event(1, &msg.ek_a);
+                Some(SessionEstablished { session_key: sk, sig_valid })
+            }
+            None => None,
+        }
     }
 }
 
@@ -110,18 +117,22 @@ impl SessionEstablished {
     }
 }
 
-/// Drive the full Signal X3DH initiator handshake through the typestate FSM.
+/// Drive the full Signal X3DH initiator handshake through the typestate FSM;
+/// `None` when the bundle fails the input check.
 pub fn run_signal_handshake<C: X3dhCrypto, G: X3dhGhost>(
     ghost: &mut G,
     ik_a_secret: &X3dhKey,
     ek_a_secret: &X3dhKey,
     bundle: X3dhPreKeyBundle,
     use_opk: bool,
-) -> (X3dhSessionKey, bool) {
-    let est = Start
+) -> Option<(X3dhSessionKey, bool)> {
+    let established = Start
         .receive_bundle(ghost, bundle)
         .send_init::<C, G>(ghost, ik_a_secret, ek_a_secret, use_opk);
-    (*est.session_key(), est.sig_valid())
+    match established {
+        Some(est) => Some((*est.session_key(), est.sig_valid())),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -136,13 +147,13 @@ mod tests {
         ek_a_secret: &X3dhKey,
         bundle: &X3dhPreKeyBundle,
         use_opk: bool,
-    ) -> (X3dhSessionKey, bool) {
+    ) -> Option<(X3dhSessionKey, bool)> {
         ghost.event(0, &bundle.ik);
         let (sk, msg, sig_valid) =
-            initiate::<C>(ik_a_secret, ek_a_secret, bundle, use_opk);
+            initiate::<C>(ik_a_secret, ek_a_secret, bundle, use_opk)?;
         ghost.send_init(&msg);
         ghost.event(1, &msg.ek_a);
-        (sk, sig_valid)
+        Some((sk, sig_valid))
     }
 
     /// Trivial deterministic crypto to exercise the flow (not real crypto).
@@ -160,11 +171,19 @@ mod tests {
             let b = crate::types::xor_32(dh3, dh4);
             crate::types::xor_32(&a, &b)
         }
+        fn kdf3(dh1: &X3dhKey, dh2: &X3dhKey, dh3: &X3dhKey) -> X3dhSessionKey {
+            let a = crate::types::xor_32(dh1, dh2);
+            crate::types::xor_32(&a, dh3)
+        }
         fn sign(_ik_secret: &X3dhKey, _msg: &X3dhKey) -> X3dhSignature {
             ZERO_SIGNATURE
         }
         fn verify(_ik_pub: &X3dhKey, _msg: &X3dhKey, _sig: &X3dhSignature) -> bool {
             true
+        }
+        /// The all-`0xff` key is the one invalid key of the dummy group.
+        fn valid_pub(pk: &X3dhKey) -> bool {
+            *pk != [0xffu8; 32]
         }
     }
 
@@ -197,11 +216,13 @@ mod tests {
 
         let mut g_line = TraceGhost::default();
         let (sk_line, ok_line) =
-            signal_handshake::<DummyCrypto, _>(&mut g_line, &ik_a, &ek_a, &bundle, true);
+            signal_handshake::<DummyCrypto, _>(&mut g_line, &ik_a, &ek_a, &bundle, true)
+                .expect("valid bundle");
 
         let mut g_fsm = TraceGhost::default();
         let (sk_fsm, ok_fsm) =
-            run_signal_handshake::<DummyCrypto, _>(&mut g_fsm, &ik_a, &ek_a, bundle, true);
+            run_signal_handshake::<DummyCrypto, _>(&mut g_fsm, &ik_a, &ek_a, bundle, true)
+                .expect("valid bundle");
 
         assert_eq!(sk_fsm, sk_line, "session key differs");
         assert_eq!(ok_fsm, ok_line, "sig verdict differs");
@@ -222,8 +243,41 @@ mod tests {
         };
         let est = Start
             .receive_bundle(&mut g, bundle)
-            .send_init::<DummyCrypto, _>(&mut g, &[1u8; 32], &[2u8; 32], false);
+            .send_init::<DummyCrypto, _>(&mut g, &[1u8; 32], &[2u8; 32], false)
+            .expect("valid bundle");
         assert!(est.sig_valid());
         let _k = *est.session_key();
+    }
+
+    #[test]
+    fn invalid_bundle_key_sends_nothing() {
+        let bundle = X3dhPreKeyBundle {
+            ik: [3u8; 32],
+            spk: [0xffu8; 32],
+            opk: [5u8; 32],
+            sig: ZERO_SIGNATURE,
+        };
+        let mut g = TraceGhost::default();
+        let r = run_signal_handshake::<DummyCrypto, _>(&mut g, &[1u8; 32], &[2u8; 32], bundle, true);
+        assert!(r.is_none(), "a bundle with an invalid signed prekey is rejected");
+        assert!(g.sends.is_empty(), "no init message on the wire");
+        assert_eq!(g.events.len(), 1, "only the bundle-received event");
+    }
+
+    #[test]
+    fn unused_one_time_prekey_is_not_checked() {
+        let bundle = X3dhPreKeyBundle {
+            ik: [3u8; 32],
+            spk: [4u8; 32],
+            opk: [0xffu8; 32],
+            sig: ZERO_SIGNATURE,
+        };
+        let mut g = TraceGhost::default();
+        let with_opk =
+            run_signal_handshake::<DummyCrypto, _>(&mut g, &[1u8; 32], &[2u8; 32], bundle, true);
+        assert!(with_opk.is_none(), "an invalid one-time prekey is rejected when used");
+        let without_opk =
+            run_signal_handshake::<DummyCrypto, _>(&mut g, &[1u8; 32], &[2u8; 32], bundle, false);
+        assert!(without_opk.is_some(), "the one-time prekey is not decoded when unused");
     }
 }

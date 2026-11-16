@@ -17,5 +17,5 @@ hex = "0.4"
 proptest = "1"
 
 [lints.rust]
-# `cfg(kani)` is set by the Kani tool but unknown to rustc.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+# `cfg(kani)` is set by the Kani tool and `cfg(hax)` by hax; both are unknown to rustc.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(hax)'] }

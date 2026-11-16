@@ -16,8 +16,10 @@
 //! that mis-orders or duplicates a transition does not type-check.
 //!
 //! The socket I/O stays outside the machine: the `send` is a call on the
-//! `PqxdhGhost` instance, and the DH/KEM/KDF go through the `PqxdhCrypto`
-//! trait. The test `pqxdh_matches_straight_line` checks that the machine
+//! `PqxdhGhost` instance, and the DH/KEM/KDF and the input check of peer
+//! public keys go through the `PqxdhCrypto` trait. `send_init`, `run_pqxdh`
+//! and `pqxdh_initiate_term` return `None`, and send nothing, when a key of
+//! the bundle fails the input check, as `protocol::initiate` does. The test `pqxdh_matches_straight_line` checks that the machine
 //! produces the same message/event trace and session key as the straight-line
 //! function.
 
@@ -137,7 +139,10 @@ impl<const KEM_PK: usize> BundleVerified<KEM_PK> {
     }
 
     /// Transition `BundleVerified -> Established`: run the DH/KEM ladder, derive
-    /// the session key, and emit Alice's init message.
+    /// the session key, and emit Alice's init message. Returns `None`, and
+    /// emits nothing, when a Diffie-Hellman public key of the bundle that the
+    /// ladder uses (`ik`, `spk`, and `opk` when `use_opk`) fails the input
+    /// check `valid_pub`.
     ///
     /// Consumes `self`, so the init message cannot be sent twice.
     pub fn send_init<
@@ -152,8 +157,106 @@ impl<const KEM_PK: usize> BundleVerified<KEM_PK> {
         ek_a_secret: &PqxdhDhKey,
         kem_randomness: &PqxdhKemSs,
         use_opk: bool,
-    ) -> Established {
+    ) -> Option<Established> {
         let bundle = &self.bundle;
+        let keys_valid = C::valid_pub(&bundle.ik)
+            && C::valid_pub(&bundle.spk)
+            && (!use_opk || C::valid_pub(&bundle.opk));
+        if keys_valid {
+            let ik_a_pub = C::dh_pub(ik_a_secret);
+            let ek_a_pub = C::dh_pub(ek_a_secret);
+
+            let dh1 = C::dh(ik_a_secret, &bundle.spk);
+            let dh2 = C::dh(ek_a_secret, &bundle.ik);
+            let dh3 = C::dh(ek_a_secret, &bundle.spk);
+            let dh4 = if use_opk {
+                C::dh(ek_a_secret, &bundle.opk)
+            } else {
+                ZERO_DH_KEY
+            };
+
+            let (kem_ct, kem_ss) = C::kem_encaps(&bundle.pqpk, kem_randomness);
+            let session_key = C::kdf(&dh1, &dh2, &dh3, &dh4, &kem_ss);
+
+            let msg: PqxdhInitMessage<KEM_CT> = PqxdhInitMessage {
+                ik_a: ik_a_pub,
+                ek_a: ek_a_pub,
+                kem_ct,
+                opk_id: if use_opk { [0, 0, 0, 1] } else { [0, 0, 0, 0] },
+            };
+            ghost.event(1, &msg.ek_a);
+            ghost.send_msg(&msg.ek_a);
+
+            Some(Established { session_key })
+        } else {
+            None
+        }
+    }
+}
+
+impl Established {
+    /// The established session key.
+    pub fn key(&self) -> &PqxdhSessionKey {
+        &self.session_key
+    }
+
+    /// Consume the terminal state and take ownership of the session key.
+    pub fn into_key(self) -> PqxdhSessionKey {
+        self.session_key
+    }
+}
+
+/// Drive the full initiator exchange through the typestate FSM. The state values
+/// thread `Init -> BundleVerified -> Established`; the Rust type checker verifies
+/// that the transitions occur in exactly this order. `None` when the bundle
+/// fails the input check of `send_init`.
+pub fn run_pqxdh<
+    C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
+    const KEM_PK: usize,
+    const KEM_SK: usize,
+    const KEM_CT: usize,
+    G: PqxdhGhost,
+>(
+    ghost: &mut G,
+    bundle: &PqxdhPreKeyBundle<KEM_PK>,
+    ik_a_secret: &PqxdhDhKey,
+    ek_a_secret: &PqxdhDhKey,
+    kem_randomness: &PqxdhKemSs,
+    use_opk: bool,
+) -> Option<PqxdhSessionKey> {
+    let established = Init
+        .recv_bundle::<C, KEM_PK, KEM_SK, KEM_CT, G>(ghost, bundle)
+        .send_init::<C, KEM_SK, KEM_CT, G>(ghost, ik_a_secret, ek_a_secret, kem_randomness, use_opk);
+    match established {
+        Some(est) => Some(est.into_key()),
+        None => None,
+    }
+}
+
+/// The same message flow as the typestate machine, written as one
+/// straight-line function; `pqxdh_matches_straight_line` compares the two.
+pub fn pqxdh_initiate_term<
+    C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
+    const KEM_PK: usize,
+    const KEM_SK: usize,
+    const KEM_CT: usize,
+    G: PqxdhGhost,
+>(
+    ghost: &mut G,
+    bundle: &PqxdhPreKeyBundle<KEM_PK>,
+    ik_a_secret: &PqxdhDhKey,
+    ek_a_secret: &PqxdhDhKey,
+    kem_randomness: &PqxdhKemSs,
+    use_opk: bool,
+) -> Option<PqxdhSessionKey> {
+    ghost.event(0, &bundle.ik);
+    let _spk_sig_valid = C::verify(&bundle.ik, &bundle.spk, &bundle.spk_sig);
+    let _pqpk_sig_valid = C::verify(&bundle.ik, &C::kem_pk_encode(&bundle.pqpk), &bundle.pqpk_sig);
+
+    let keys_valid = C::valid_pub(&bundle.ik)
+        && C::valid_pub(&bundle.spk)
+        && (!use_opk || C::valid_pub(&bundle.opk));
+    if keys_valid {
         let ik_a_pub = C::dh_pub(ik_a_secret);
         let ek_a_pub = C::dh_pub(ek_a_secret);
 
@@ -178,89 +281,10 @@ impl<const KEM_PK: usize> BundleVerified<KEM_PK> {
         ghost.event(1, &msg.ek_a);
         ghost.send_msg(&msg.ek_a);
 
-        Established { session_key }
-    }
-}
-
-impl Established {
-    /// The established session key.
-    pub fn key(&self) -> &PqxdhSessionKey {
-        &self.session_key
-    }
-
-    /// Consume the terminal state and take ownership of the session key.
-    pub fn into_key(self) -> PqxdhSessionKey {
-        self.session_key
-    }
-}
-
-/// Drive the full initiator exchange through the typestate FSM. The state values
-/// thread `Init -> BundleVerified -> Established`; the Rust type checker verifies
-/// that the transitions occur in exactly this order.
-pub fn run_pqxdh<
-    C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
-    const KEM_PK: usize,
-    const KEM_SK: usize,
-    const KEM_CT: usize,
-    G: PqxdhGhost,
->(
-    ghost: &mut G,
-    bundle: &PqxdhPreKeyBundle<KEM_PK>,
-    ik_a_secret: &PqxdhDhKey,
-    ek_a_secret: &PqxdhDhKey,
-    kem_randomness: &PqxdhKemSs,
-    use_opk: bool,
-) -> PqxdhSessionKey {
-    Init.recv_bundle::<C, KEM_PK, KEM_SK, KEM_CT, G>(ghost, bundle)
-        .send_init::<C, KEM_SK, KEM_CT, G>(ghost, ik_a_secret, ek_a_secret, kem_randomness, use_opk)
-        .into_key()
-}
-
-/// The same message flow as the typestate machine, written as one
-/// straight-line function; `pqxdh_matches_straight_line` compares the two.
-pub fn pqxdh_initiate_term<
-    C: PqxdhCrypto<KEM_PK, KEM_SK, KEM_CT>,
-    const KEM_PK: usize,
-    const KEM_SK: usize,
-    const KEM_CT: usize,
-    G: PqxdhGhost,
->(
-    ghost: &mut G,
-    bundle: &PqxdhPreKeyBundle<KEM_PK>,
-    ik_a_secret: &PqxdhDhKey,
-    ek_a_secret: &PqxdhDhKey,
-    kem_randomness: &PqxdhKemSs,
-    use_opk: bool,
-) -> PqxdhSessionKey {
-    ghost.event(0, &bundle.ik);
-    let _spk_sig_valid = C::verify(&bundle.ik, &bundle.spk, &bundle.spk_sig);
-    let _pqpk_sig_valid = C::verify(&bundle.ik, &C::kem_pk_encode(&bundle.pqpk), &bundle.pqpk_sig);
-
-    let ik_a_pub = C::dh_pub(ik_a_secret);
-    let ek_a_pub = C::dh_pub(ek_a_secret);
-
-    let dh1 = C::dh(ik_a_secret, &bundle.spk);
-    let dh2 = C::dh(ek_a_secret, &bundle.ik);
-    let dh3 = C::dh(ek_a_secret, &bundle.spk);
-    let dh4 = if use_opk {
-        C::dh(ek_a_secret, &bundle.opk)
+        Some(session_key)
     } else {
-        ZERO_DH_KEY
-    };
-
-    let (kem_ct, kem_ss) = C::kem_encaps(&bundle.pqpk, kem_randomness);
-    let session_key = C::kdf(&dh1, &dh2, &dh3, &dh4, &kem_ss);
-
-    let msg: PqxdhInitMessage<KEM_CT> = PqxdhInitMessage {
-        ik_a: ik_a_pub,
-        ek_a: ek_a_pub,
-        kem_ct,
-        opk_id: if use_opk { [0, 0, 0, 1] } else { [0, 0, 0, 0] },
-    };
-    ghost.event(1, &msg.ek_a);
-    ghost.send_msg(&msg.ek_a);
-
-    session_key
+        None
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +334,10 @@ mod tests {
         fn verify(_ik_pub: &PqxdhDhKey, _msg: &[u8; 32], _sig: &PqxdhSignature) -> bool {
             true
         }
+        /// The all-`0xff` key is the one invalid key of the dummy group.
+        fn valid_pub(pk: &PqxdhDhKey) -> bool {
+            *pk != [0xffu8; 32]
+        }
     }
 
     fn dummy_bundle() -> PqxdhPreKeyBundle<32> {
@@ -341,13 +369,15 @@ mod tests {
             &ek_a,
             &rand,
             true,
-        );
+        )
+        .expect("valid bundle");
 
         // Typestate FSM — same inputs, same trivial crypto.
         let mut g_fsm = TraceGhost::default();
         let sk_fsm = run_pqxdh::<DummyCrypto, 32, 32, 32, _>(
             &mut g_fsm, &bundle, &ik_a, &ek_a, &rand, true,
-        );
+        )
+        .expect("valid bundle");
 
         assert_eq!(sk_fsm, sk_line, "typestate FSM key differs from straight-line function");
         assert_eq!(g_fsm.sends, g_line.sends, "send trace differs");
@@ -364,15 +394,49 @@ mod tests {
         let mut g = TraceGhost::default();
         let verified = Init.recv_bundle::<DummyCrypto, 32, 32, 32, _>(&mut g, &bundle);
         assert!(verified.signatures_valid());
-        let est = verified.send_init::<DummyCrypto, 32, 32, _>(
-            &mut g,
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-            true,
-        );
+        let est = verified
+            .send_init::<DummyCrypto, 32, 32, _>(&mut g, &[1u8; 32], &[2u8; 32], &[3u8; 32], true)
+            .expect("valid bundle");
         let by_ref = *est.key();
         let owned = est.into_key();
         assert_eq!(by_ref, owned);
+    }
+
+    /// A bundle with an invalid key that the ladder uses is rejected by the
+    /// machine and by the straight-line function, and no init message is sent.
+    #[test]
+    fn invalid_bundle_key_sends_nothing() {
+        let bundle = PqxdhPreKeyBundle { spk: [0xffu8; 32], ..dummy_bundle() };
+        let mut g_fsm = TraceGhost::default();
+        let r = run_pqxdh::<DummyCrypto, 32, 32, 32, _>(
+            &mut g_fsm, &bundle, &[1u8; 32], &[2u8; 32], &[3u8; 32], true,
+        );
+        assert!(r.is_none(), "a bundle with an invalid signed prekey is rejected");
+        assert!(g_fsm.sends.is_empty(), "no init message on the wire");
+        assert_eq!(g_fsm.events.len(), 1, "only the bundle-received event");
+
+        let mut g_line = TraceGhost::default();
+        let r_line = pqxdh_initiate_term::<DummyCrypto, 32, 32, 32, _>(
+            &mut g_line, &bundle, &[1u8; 32], &[2u8; 32], &[3u8; 32], true,
+        );
+        assert!(r_line.is_none());
+        assert_eq!(g_fsm.events, g_line.events, "event trace differs");
+        assert_eq!(g_fsm.sends, g_line.sends, "send trace differs");
+    }
+
+    /// An invalid one-time prekey is rejected when it is used and not checked
+    /// when it is not.
+    #[test]
+    fn unused_one_time_prekey_is_not_checked() {
+        let bundle = PqxdhPreKeyBundle { opk: [0xffu8; 32], ..dummy_bundle() };
+        let mut g = TraceGhost::default();
+        let with_opk = run_pqxdh::<DummyCrypto, 32, 32, 32, _>(
+            &mut g, &bundle, &[1u8; 32], &[2u8; 32], &[3u8; 32], true,
+        );
+        assert!(with_opk.is_none());
+        let without_opk = run_pqxdh::<DummyCrypto, 32, 32, 32, _>(
+            &mut g, &bundle, &[1u8; 32], &[2u8; 32], &[3u8; 32], false,
+        );
+        assert!(without_opk.is_some());
     }
 }

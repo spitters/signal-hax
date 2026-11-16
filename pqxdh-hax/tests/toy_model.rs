@@ -24,6 +24,10 @@
 //! 11. DH consistency across protocol
 //! 12. KEM wrong key rejection
 //! 13. Type sizes
+//! 14. Determinism
+//! 15. PQ contribution
+//! 16. Input check of peer public keys, including the identity `1` of the
+//!     toy group
 
 use pqxdh_hax::types::*;
 use pqxdh_hax::protocol::*;
@@ -138,6 +142,13 @@ impl PqxdhCrypto<32, 32, 32> for KaniSimplifiedPqxdh {
         }
         ok
     }
+    /// A toy public key is a value in `[2, P)` held in the last eight bytes:
+    /// an element of Z_P^* other than the identity `1`.
+    fn valid_pub(pk: &PqxdhDhKey) -> bool {
+        let mut v: u64 = 0;
+        for i in 24..32 { v = (v << 8) | pk[i] as u64; }
+        pk[..24].iter().all(|&b| b == 0) && v > 1 && v < P
+    }
 }
 
 // ============================================================
@@ -217,11 +228,11 @@ fn kat_pqxdh_with_opk() {
     let (bundle, pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let kem_rand = val_to_key(70);
     let (sk_a, msg, spk_ok, pqpk_ok) =
-        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true);
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true).unwrap();
     assert!(spk_ok, "SPK signature valid");
     assert!(pqpk_ok, "PQPK signature valid");
 
-    let sk_b = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, true);
+    let sk_b = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, true).unwrap();
     assert_eq!(sk_a, sk_b, "4DH+KEM: both sides derive same session key");
 }
 
@@ -241,8 +252,8 @@ fn kat_pqxdh_without_opk() {
     let (bundle, pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let kem_rand = val_to_key(70);
     let (sk_a, msg, _, _) =
-        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, false);
-    let sk_b = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, false);
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, false).unwrap();
+    let sk_b = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, false).unwrap();
     assert_eq!(sk_a, sk_b, "3DH+KEM: both sides derive same session key");
 }
 
@@ -261,8 +272,8 @@ fn kat_3dh_vs_4dh() {
 
     let (bundle, _pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let kem_rand = val_to_key(70);
-    let (sk_3dh, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, false);
-    let (sk_4dh, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true);
+    let (sk_3dh, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, false).unwrap();
+    let (sk_4dh, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true).unwrap();
     assert_ne!(sk_3dh, sk_4dh, "3DH+KEM and 4DH+KEM produce different keys");
 }
 
@@ -284,7 +295,7 @@ fn kat_wrong_spk_signature() {
     let ek_a = val_to_key(20);
     let kem_rand = val_to_key(70);
     let (_, _, spk_ok, pqpk_ok) =
-        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true);
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true).unwrap();
     assert!(!spk_ok, "tampered SPK signature detected");
     assert!(pqpk_ok, "PQPK signature still valid");
 }
@@ -303,7 +314,7 @@ fn kat_wrong_pqpk_signature() {
     let ek_a = val_to_key(20);
     let kem_rand = val_to_key(70);
     let (_, _, spk_ok, pqpk_ok) =
-        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true);
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true).unwrap();
     assert!(spk_ok, "SPK signature still valid");
     assert!(!pqpk_ok, "tampered PQPK signature detected");
 }
@@ -324,8 +335,8 @@ fn kat_different_ephemeral_keys() {
 
     let (bundle, _pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let kem_rand = val_to_key(70);
-    let (sk1, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a1, &bundle, &kem_rand, true);
-    let (sk2, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a2, &bundle, &kem_rand, true);
+    let (sk1, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a1, &bundle, &kem_rand, true).unwrap();
+    let (sk2, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a2, &bundle, &kem_rand, true).unwrap();
     assert_ne!(sk1, sk2, "different ephemeral keys => different session keys");
 }
 
@@ -343,8 +354,8 @@ fn kat_different_kem_randomness() {
     let kem_seed = val_to_key(60);
 
     let (bundle, _pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
-    let (sk1, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &val_to_key(70), true);
-    let (sk2, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &val_to_key(71), true);
+    let (sk1, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &val_to_key(70), true).unwrap();
+    let (sk2, _, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &val_to_key(71), true).unwrap();
     assert_ne!(sk1, sk2, "different KEM randomness => different session keys (PQ contribution)");
 }
 
@@ -363,7 +374,7 @@ fn kat_init_message_content() {
 
     let (bundle, _pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let kem_rand = val_to_key(70);
-    let (_, msg, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true);
+    let (_, msg, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true).unwrap();
 
     assert_eq!(msg.ik_a, KaniSimplifiedPqxdh::dh_pub(&ik_a), "msg contains Alice's IK");
     assert_eq!(msg.ek_a, KaniSimplifiedPqxdh::dh_pub(&ek_a), "msg contains Alice's EK");
@@ -382,7 +393,7 @@ fn kat_init_message_no_opk() {
 
     let (bundle, _pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let kem_rand = val_to_key(70);
-    let (_, msg, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, false);
+    let (_, msg, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, false).unwrap();
     assert_eq!(msg.opk_id, [0, 0, 0, 0], "opk_id is zero when OPK not used");
 }
 
@@ -460,13 +471,13 @@ fn kat_determinism() {
     let (bundle1, pqsk1) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
     let (bundle2, pqsk2) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &kem_seed);
 
-    let (sk_a1, msg1, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle1, &kem_rand, true);
-    let (sk_a2, msg2, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle2, &kem_rand, true);
+    let (sk_a1, msg1, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle1, &kem_rand, true).unwrap();
+    let (sk_a2, msg2, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle2, &kem_rand, true).unwrap();
     assert_eq!(sk_a1, sk_a2, "deterministic session key (Alice)");
     assert_eq!(msg1.kem_ct, msg2.kem_ct, "deterministic KEM ciphertext");
 
-    let sk_b1 = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk1, &msg1, true);
-    let sk_b2 = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk2, &msg2, true);
+    let sk_b1 = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk1, &msg1, true).unwrap();
+    let sk_b2 = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk2, &msg2, true).unwrap();
     assert_eq!(sk_b1, sk_b2, "deterministic session key (Bob)");
     assert_eq!(sk_a1, sk_b1, "Alice and Bob agree");
 }
@@ -490,14 +501,14 @@ fn kat_pq_contribution() {
     // Session with real KEM randomness
     let kem_rand = val_to_key(70);
     let (sk_with_kem, msg, _, _) =
-        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true);
-    let sk_b = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, true);
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand, true).unwrap();
+    let sk_b = respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, &msg, true).unwrap();
     assert_eq!(sk_with_kem, sk_b, "real KEM: both sides agree");
 
     // Session with different KEM randomness
     let kem_rand2 = val_to_key(71);
     let (sk_different_rand, _, _, _) =
-        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand2, true);
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, &bundle, &kem_rand2, true).unwrap();
     assert_ne!(sk_with_kem, sk_different_rand,
         "different KEM randomness => different session key");
 
@@ -509,4 +520,76 @@ fn kat_pq_contribution() {
     let sk_no_kem = KaniSimplifiedPqxdh::kdf(&dh1, &dh2, &dh3, &dh4, &ZERO_KEM_SS);
     assert_ne!(sk_with_kem, sk_no_kem,
         "removing KEM contribution changes session key");
+}
+
+// ============================================================
+// 16. Input check of peer public keys
+// ============================================================
+
+/// A key outside the toy group: the value `P`, which is not reduced.
+fn invalid_key() -> PqxdhDhKey {
+    let mut k = [0u8; 32];
+    k[24..32].copy_from_slice(&P.to_be_bytes());
+    k
+}
+
+#[test]
+fn initiate_rejects_invalid_bundle_keys() {
+    let (ik_a, ek_a, kem_rand) = (val_to_key(10), val_to_key(20), val_to_key(70));
+    let (bundle, _pqsk) = create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(
+        &val_to_key(30), &val_to_key(40), &val_to_key(50), &val_to_key(60));
+    let init = |b: &PqxdhPreKeyBundle<32>, use_opk: bool| {
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, b, &kem_rand, use_opk)
+    };
+    assert!(init(&bundle, true).is_some());
+    let bad_ik = PqxdhPreKeyBundle { ik: invalid_key(), ..bundle };
+    let bad_spk = PqxdhPreKeyBundle { spk: invalid_key(), ..bundle };
+    let bad_opk = PqxdhPreKeyBundle { opk: invalid_key(), ..bundle };
+    assert!(init(&bad_ik, true).is_none());
+    assert!(init(&bad_spk, false).is_none());
+    assert!(init(&bad_opk, true).is_none());
+    // Without the one-time prekey, its key is not used and not checked.
+    assert!(init(&bad_opk, false).is_some());
+}
+
+#[test]
+fn respond_rejects_invalid_message_keys() {
+    let (ik_b, spk_b, opk_b) = (val_to_key(30), val_to_key(40), val_to_key(50));
+    let (bundle, pqsk) =
+        create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &val_to_key(60));
+    let (_, msg, _, _) = initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(
+        &val_to_key(10), &val_to_key(20), &bundle, &val_to_key(70), true).unwrap();
+    let resp = |m: &PqxdhInitMessage<32>, use_opk: bool| {
+        respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, m, use_opk)
+    };
+    assert!(resp(&msg, true).is_some());
+    let bad_ik = PqxdhInitMessage { ik_a: invalid_key(), ..msg };
+    let bad_ek = PqxdhInitMessage { ek_a: [0u8; 32], ..msg };
+    assert!(resp(&bad_ik, true).is_none());
+    assert!(resp(&bad_ek, false).is_none());
+}
+
+/// The identity `1` of the toy group is rejected in every checked position:
+/// on it every DH value would be the identity, independent of the secret.
+#[test]
+fn identity_key_rejected() {
+    let one = val_to_key(1);
+    assert!(!KaniSimplifiedPqxdh::valid_pub(&one));
+    let (ik_b, spk_b, opk_b) = (val_to_key(30), val_to_key(40), val_to_key(50));
+    let (bundle, pqsk) =
+        create_bundle::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &val_to_key(60));
+    let (ik_a, ek_a, kem_rand) = (val_to_key(10), val_to_key(20), val_to_key(70));
+    let init = |b: &PqxdhPreKeyBundle<32>, use_opk: bool| {
+        initiate::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_a, &ek_a, b, &kem_rand, use_opk)
+    };
+    assert!(init(&PqxdhPreKeyBundle { ik: one, ..bundle }, false).is_none());
+    assert!(init(&PqxdhPreKeyBundle { spk: one, ..bundle }, false).is_none());
+    assert!(init(&PqxdhPreKeyBundle { opk: one, ..bundle }, true).is_none());
+    let (_, msg, _, _) = init(&bundle, true).unwrap();
+    let resp = |m: &PqxdhInitMessage<32>, use_opk: bool| {
+        respond::<KaniSimplifiedPqxdh, 32, 32, 32>(&ik_b, &spk_b, &opk_b, &pqsk, m, use_opk)
+    };
+    assert!(resp(&PqxdhInitMessage { ik_a: one, ..msg }, true).is_none());
+    assert!(resp(&PqxdhInitMessage { ek_a: one, ..msg }, true).is_none());
+    assert!(resp(&PqxdhInitMessage { ek_a: one, ..msg }, false).is_none());
 }
